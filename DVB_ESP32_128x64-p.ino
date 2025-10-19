@@ -1,92 +1,96 @@
 // ===== ESP32-WROOM + 128x64 I2C ST7567 JLX12864 (U8g2) =====
-
+// Basis-Funktionen:
+// - SLOW Marquee (250ms, 2px)
+// - Reload 30s
+// - Right-aligned minutes
+// - Scroll-Redraw NUR Zielspalte
+// + WLAN Setup (Webinterface, NVS)
+// + Paging (bis 10 Einträge, 2 Seiten à 5)
+// + Boot-Delay mit Setup-Hinweis (BOOT halten)
+// + Setupmodus: LCD-Anleitung (Paging)
 
 #include <Arduino.h>
 #include <Wire.h>
 #include <WiFi.h>
-#include <WiFiMulti.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <U8g2lib.h>
 #include <WebServer.h>
 #include <Preferences.h>
-#include "esp_system.h"  // esp_restart()
 
-// ---------- Pins / Display ----------
-#define SDA_PIN         21
-#define SCL_PIN         22
-#define RST_PIN         U8X8_PIN_NONE
-#define I2C_ADDR_7BIT   0x3F
+// ---------- I2C / Display ----------
+#define SDA_PIN        21
+#define SCL_PIN        22
+#define RST_PIN        U8X8_PIN_NONE
+#define I2C_ADDR_7BIT  0x3F
 U8G2_ST7567_JLX12864_F_HW_I2C u8g2(U8G2_R0, RST_PIN, SCL, SDA);
 
-// ---------- Layout ----------
-const uint8_t  WIDTH = 128, HEIGHT = 64;
-const int8_t   DISP_XOFF = 0;
-const uint8_t  ROWS = 5, ROW_H = 12, TOP_Y = 0;
-const uint8_t  COL_LINE_W = 22, COL_RIGHT_W = 24, COL_GAP = 4;
-const uint8_t  COL_DEST_X = DISP_XOFF + COL_LINE_W + COL_GAP;
-const uint8_t  COL_DEST_W = 128 - DISP_XOFF - COL_DEST_X - COL_RIGHT_W - 2;
+// ---------- Layout / Feintuning ----------
+const uint8_t WIDTH = 128, HEIGHT = 64;
+const int8_t  DISP_XOFF = 0;
+const uint8_t VISIBLE_ROWS = 5;        // sichtbare Zeilen pro Seite
+const uint8_t ROW_H = 12, TOP_Y = 0;
+const uint8_t COL_LINE_W = 22, COL_RIGHT_W = 24, COL_GAP = 4;
+const uint8_t COL_DEST_X = DISP_XOFF + COL_LINE_W + COL_GAP;
+const uint8_t COL_DEST_W = 128 - DISP_XOFF - COL_DEST_X - COL_RIGHT_W - 2;
 
-// ---------- Timing / Netzwerk ----------
-#define FETCH_INTERVAL_MS   30000UL
-#define SCROLL_INTERVAL_MS  250UL
+// ---------- Netzwerk & Timing ----------
+#define FETCH_INTERVAL_MS   30000UL   // 30 s
+#define SCROLL_INTERVAL_MS  250UL     // Marquee-Tick
 #define SCROLL_STEP_PX      2
 #define HTTP_TIMEOUT_MS     5000UL
 #define JSON_DOC_CAP        4096
 #define MAX_ERRORS          5
-#define RESET_INTERVAL_MS   (60UL * 60UL * 1000UL)
-#define USE_HARD_RESET      0
 
-// ---------- Konfiguration & Setup ----------
-#define CFG_NAMESPACE   "dvb"
-#define CFG_KEY_SSID    "ssid"
-#define CFG_KEY_PW      "pw"
-#define CFG_KEY_HST     "hst"
-#define CFG_KEY_ORT     "ort"
-#define CFG_KEY_OFF     "offset"
-#define CFG_KEY_LIM     "limit"
+// ---------- Paging (Anzeige) ----------
+#define MAX_ROWS            10        // bis zu 10 Einträge insgesamt
+#define PAGE_INTERVAL_MS    6000UL    // Seitenwechsel alle 6 s
 
-#define DEFAULT_SSID    ""
-#define DEFAULT_PW      ""
-#define DEFAULT_HST     "Reichenbachstrasse"
-#define DEFAULT_ORT     "Dresden"
-#define DEFAULT_OFFSET  0
-#define DEFAULT_LIMIT   5
+// ---------- Boot-Setup ----------
+#define BOOT_BUTTON_PIN     0         // BOOT-Taste
+#define BOOT_DELAY_MS       5000UL    // 5s Fenster für Setup
 
-#define CONFIG_BUTTON_PIN   0            // BOOT-Taste bei vielen Devkits
-#define WIFI_CONNECT_MS     10000UL
-#define BOOT_DELAY_MS       5000UL       // Setup-Fenster beim Boot
+// ---------- WLAN + Konfig ----------
+#define CFG_NAMESPACE "dvb"
+#define CFG_SSID "ssid"
+#define CFG_PW   "pw"
+#define CFG_HST  "hst"
+#define CFG_ORT  "ort"
+#define CFG_OFF  "offset"
+#define CFG_LIM  "limit"
 
-// Setup-Portal
-#define SETUP_PWD           "collaborative"  //
-#define SETUP_PAGE_MS       4000UL           // Auto-Paging alle 4 s
+#define DEFAULT_HST  "Reichenbachstrasse"
+#define DEFAULT_ORT  "Dresden"
+#define DEFAULT_OFF  0
+#define DEFAULT_LIM  5
+#define WIFI_CONNECT_MS 10000UL
 
 Preferences prefs;
 WebServer server(80);
-WiFiMulti wifiMulti;
 
 struct Config {
   String ssid, pw, hst, ort;
-  int offsetMin = DEFAULT_OFFSET;
-  int limit     = DEFAULT_LIMIT;
+  int offsetMin = DEFAULT_OFF;
+  int limit     = DEFAULT_LIM; // 1..10
 } cfg;
 
 // ---------- Datenmodell ----------
 struct Row {
-  String line, dest, mins;
-  int16_t offsetPx = 0;
-  int16_t textW = 0;
-  int16_t cyclePx = 1;
-  bool    needsScroll = false;
+  String  line, dest, mins;
+  int16_t offsetPx = 0;   // Marquee-Offset
+  int16_t textW    = 0;   // Pixelbreite der Destination
 };
-
-Row rows[ROWS];
-bool     haveRows = false;
+Row rows[MAX_ROWS];
 uint8_t  failCount = 0;
-uint32_t tFetch = 0, tScroll = 0, tReset = 0;
+uint32_t tFetch = 0, tScroll = 0;
+
+// Paging-Status
+uint8_t  pageIndex = 0;   // 0..pageCount-1
+uint8_t  pageCount = 1;
+uint32_t tPage     = 0;
 
 // ---------- Utils ----------
-static inline void sanitizeDest(String&) {}
+static inline void sanitizeDest(String& s) { s.replace("Platz","Pl"); }
 
 static inline void drawRightAlignedText(int16_t rightX, int16_t baseY, const String& s) {
   int w = u8g2.getUTF8Width(s.c_str());
@@ -95,24 +99,16 @@ static inline void drawRightAlignedText(int16_t rightX, int16_t baseY, const Str
 }
 
 static inline void drawBadge(int16_t x, int16_t y, const String& lineTxt) {
-  u8g2.drawRBox(x, y - 10, COL_LINE_W - 2, 11, 2);
-  u8g2.setDrawColor(1);
-  u8g2.setCursor(x + 1, y - 1);
-  u8g2.print(lineTxt);
+  u8g2.drawRBox(x, y-10, COL_LINE_W-2, 11, 2);
   u8g2.setDrawColor(0);
+  u8g2.setCursor(x+1, y-1);
+  u8g2.print(lineTxt);
+  u8g2.setDrawColor(1);
 }
 
-static inline void updateRowDerived(Row& row) {
-  String tmp = row.dest;
-  row.textW = u8g2.getUTF8Width(tmp.c_str());
-  const int16_t gapPx = 16;
-  row.cyclePx = max<int16_t>(1, row.textW + gapPx);
-  row.needsScroll = (row.textW > COL_DEST_W);
-}
-
-// ---------- Hilfsfunktionen für URL / Minuten ----------
 static String urlEncodeLight(const String& in) {
-  String out; out.reserve(in.length()*3);
+  // bewusst simpel: nur Space -> %20
+  String out; out.reserve(in.length()*2);
   for (char c : in) out += (c == ' ') ? "%20" : String(c);
   return out;
 }
@@ -127,147 +123,172 @@ static String buildUrl() {
 }
 
 static String applyOffsetToMins(const String& m) {
-  int i = 0; while (i < (int)m.length() && isspace((unsigned char)m[i])) i++;
-  int j = i; while (j < (int)m.length() && isdigit((unsigned char)m[j])) j++;
+  int i=0; while (i<(int)m.length() && isspace((unsigned char)m[i])) i++;
+  int j=i; while (j<(int)m.length() && isdigit((unsigned char)m[j])) j++;
   if (j==i) return m;
-  int val = m.substring(i, j).toInt();
-  val += cfg.offsetMin;
-  if (val < 0) val = 0;
+  int val = m.substring(i,j).toInt();
+  val += cfg.offsetMin; if (val < 0) val = 0;
   String rest = m.substring(j);
   return String(val) + rest;
+}
+
+static inline void drawPageIndicator() {
+  if (pageCount > 1 && pageIndex > 0) {
+    u8g2.drawPixel(0, 0);
+    u8g2.drawPixel(WIDTH-1, 0);
+    u8g2.drawPixel(0, HEIGHT-1);
+    u8g2.drawPixel(WIDTH-1, HEIGHT-1);
+  }
 }
 
 // ---------- Render ----------
 void renderFull() {
   u8g2.clearBuffer();
-  u8g2.setDrawColor(1); u8g2.drawBox(0,0,WIDTH,HEIGHT);
-  u8g2.setDrawColor(0);
   u8g2.setFont(u8g2_font_6x12_tf);
 
-  for (uint8_t r=0; r<ROWS; ++r) {
-    if (!(rows[r].line.length() || rows[r].dest.length())) continue;
+  const uint8_t base = pageIndex * VISIBLE_ROWS;
+  for (uint8_t r=0; r<VISIBLE_ROWS; ++r) {
+    const uint8_t idx = base + r;
+    if (idx >= MAX_ROWS) break;
+    if (!(rows[idx].line.length() || rows[idx].dest.length())) continue;
+
     int16_t baseY = TOP_Y + r*ROW_H + ROW_H;
+    if (rows[idx].line.length()) drawBadge(DISP_XOFF + 1, baseY, rows[idx].line);
 
-    if (rows[r].line.length()) drawBadge(DISP_XOFF + 1, baseY, rows[r].line);
+    String d = rows[idx].dest; sanitizeDest(d);
+    const int16_t textW = rows[idx].textW;
+    const int16_t gapPx = 16;
+    const int16_t cycle = max<int16_t>(1, textW + gapPx);
 
-    String d = rows[r].dest;
-    u8g2.setClipWindow(COL_DEST_X, baseY-11, COL_DEST_X+COL_DEST_W-1, baseY);
-    if (!rows[r].needsScroll || d.isEmpty()) {
+    u8g2.setClipWindow(COL_DEST_X, baseY-11, COL_DEST_X + COL_DEST_W - 1, baseY);
+    if (textW <= COL_DEST_W || d.length()==0) {
       u8g2.setCursor(COL_DEST_X, baseY-1);
       u8g2.print(d);
     } else {
-      int16_t x1 = COL_DEST_X - (rows[r].offsetPx % rows[r].cyclePx);
-      int16_t x2 = x1 + rows[r].cyclePx;
+      int16_t x1 = COL_DEST_X - (rows[idx].offsetPx % cycle);
+      int16_t x2 = x1 + cycle;
       u8g2.setCursor(x1, baseY-1); u8g2.print(d);
       u8g2.setCursor(x2, baseY-1); u8g2.print(d);
     }
     u8g2.setMaxClipWindow();
 
-    String m = rows[r].mins;
+    String m = rows[idx].mins;
     if (m.length()) m = applyOffsetToMins(m);
     if (m.length() > 3) m.remove(3);
     drawRightAlignedText(DISP_XOFF + 128 - 2, baseY - 1, m);
   }
-
+  drawPageIndicator();
   u8g2.sendBuffer();
 }
 
 void renderDestOnly() {
   u8g2.setFont(u8g2_font_6x12_tf);
-  for (uint8_t r=0; r<ROWS; ++r) {
-    if (!rows[r].dest.length()) continue;
+  const uint8_t base = pageIndex * VISIBLE_ROWS;
+
+  for (uint8_t r=0; r<VISIBLE_ROWS; ++r) {
+    const uint8_t idx = base + r;
+    if (idx >= MAX_ROWS) break;
+    if (!rows[idx].dest.length()) continue;
+
     int16_t baseY = TOP_Y + r*ROW_H + ROW_H;
-    u8g2.setDrawColor(1); u8g2.drawBox(COL_DEST_X, baseY-11, COL_DEST_W, 11);
+
+    // Zielbereich löschen (Original-Stil)
     u8g2.setDrawColor(0);
-    String d = rows[r].dest;
-    u8g2.setClipWindow(COL_DEST_X, baseY-11, COL_DEST_X+COL_DEST_W-1, baseY);
-    if (!rows[r].needsScroll) {
+    u8g2.drawBox(COL_DEST_X, baseY-11, COL_DEST_W, 11);
+    u8g2.setDrawColor(1);
+
+    String d = rows[idx].dest; sanitizeDest(d);
+    const int16_t textW = rows[idx].textW;
+    const int16_t gapPx = 16;
+    const int16_t cycle = max<int16_t>(1, textW + gapPx);
+
+    u8g2.setClipWindow(COL_DEST_X, baseY-11, COL_DEST_X + COL_DEST_W - 1, baseY);
+    if (textW <= COL_DEST_W) {
       u8g2.setCursor(COL_DEST_X, baseY-1); u8g2.print(d);
     } else {
-      int16_t x1 = COL_DEST_X - (rows[r].offsetPx % rows[r].cyclePx);
-      int16_t x2 = x1 + rows[r].cyclePx;
+      int16_t x1 = COL_DEST_X - (rows[idx].offsetPx % cycle);
+      int16_t x2 = x1 + cycle;
       u8g2.setCursor(x1, baseY-1); u8g2.print(d);
       u8g2.setCursor(x2, baseY-1); u8g2.print(d);
     }
     u8g2.setMaxClipWindow();
   }
+
+  drawPageIndicator();
   u8g2.sendBuffer();
 }
 
-// ---------- Networking ----------
+// ---------- Networking + JSON ----------
 bool fetchOnce() {
   if (WiFi.status() != WL_CONNECTED) return false;
+
   HTTPClient http;
   http.setTimeout(HTTP_TIMEOUT_MS);
   String url = buildUrl();
   if (!http.begin(url)) return false;
+
   http.addHeader("Accept","application/json");
   http.addHeader("Accept-Encoding","identity");
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  http.useHTTP10(true);
   int code = http.GET();
   if (code != HTTP_CODE_OK) { http.end(); return false; }
-  String payload = http.getString(); http.end();
+  String payload = http.getString();
+  http.end();
 
   StaticJsonDocument<JSON_DOC_CAP> doc;
   if (deserializeJson(doc, payload)) return false;
   if (!doc.is<JsonArrayConst>()) return false;
   JsonArrayConst arr = doc.as<JsonArrayConst>();
-  if (arr.isNull()) return false;
+  if (arr.size()==0) return false;
 
-  uint8_t r = 0;
+  uint8_t r = 0, maxRows = min((int)cfg.limit, (int)MAX_ROWS);
   for (JsonVariantConst v: arr) {
+    if (r >= maxRows) break;
     if (!v.is<JsonArrayConst>()) continue;
     JsonArrayConst rec = v.as<JsonArrayConst>();
-    if (rec.size() < 3 || r >= ROWS) continue;
+    if (rec.size() < 3) continue;
+
     rows[r].line = rec[0].as<const char*>() ?: "";
     rows[r].dest = rec[1].as<const char*>() ?: "";
     rows[r].mins = rec[2].as<const char*>() ?: "";
-    updateRowDerived(rows[r]);
+
+    String tmp = rows[r].dest; sanitizeDest(tmp);
+    rows[r].textW = u8g2.getUTF8Width(tmp.c_str());
     rows[r].offsetPx = 0;
     ++r;
   }
-  for (; r<ROWS; ++r) rows[r] = Row();
-  haveRows = true;
+  for (; r<MAX_ROWS; ++r) rows[r] = Row();
+
+  pageCount = max<uint8_t>(1, (uint8_t)((maxRows + VISIBLE_ROWS - 1) / VISIBLE_ROWS));
+  if (pageIndex >= pageCount) pageIndex = 0;
+
   return true;
 }
 
-// ---------- Soft-Rebuild ----------
-void softRebuild() {
-  u8g2.begin();
-  u8g2.enableUTF8Print();
-  u8g2.setContrast(185);
-  for (auto &r : rows) { r.offsetPx = 0; if (r.dest.length()) updateRowDerived(r); }
-  if (WiFi.status() != WL_CONNECTED) WiFi.reconnect();
-  fetchOnce();
-  renderFull();
-}
-
-// ---------- Config speichern / laden ----------
+// ---------- NVS ----------
 void loadConfig() {
   prefs.begin(CFG_NAMESPACE, true);
-  cfg.ssid = prefs.getString(CFG_KEY_SSID, DEFAULT_SSID);
-  cfg.pw   = prefs.getString(CFG_KEY_PW, DEFAULT_PW);
-  cfg.hst  = prefs.getString(CFG_KEY_HST, DEFAULT_HST);
-  cfg.ort  = prefs.getString(CFG_KEY_ORT, DEFAULT_ORT);
-  cfg.offsetMin = prefs.getInt(CFG_KEY_OFF, DEFAULT_OFFSET);
-  cfg.limit     = prefs.getInt(CFG_KEY_LIM, DEFAULT_LIMIT);
+  cfg.ssid = prefs.getString(CFG_SSID, "");
+  cfg.pw   = prefs.getString(CFG_PW,   "");
+  cfg.hst  = prefs.getString(CFG_HST,  DEFAULT_HST);
+  cfg.ort  = prefs.getString(CFG_ORT,  DEFAULT_ORT);
+  cfg.offsetMin = prefs.getInt(CFG_OFF, DEFAULT_OFF);
+  cfg.limit     = prefs.getInt(CFG_LIM, DEFAULT_LIM);
   prefs.end();
-  if (cfg.limit < 1 || cfg.limit > ROWS) cfg.limit = ROWS;
+  cfg.limit = constrain(cfg.limit, 1, MAX_ROWS);
 }
 
 void saveConfig() {
   prefs.begin(CFG_NAMESPACE, false);
-  prefs.putString(CFG_KEY_SSID, cfg.ssid);
-  prefs.putString(CFG_KEY_PW,   cfg.pw);
-  prefs.putString(CFG_KEY_HST,  cfg.hst);
-  prefs.putString(CFG_KEY_ORT,  cfg.ort);
-  prefs.putInt(CFG_KEY_OFF,     cfg.offsetMin);
-  prefs.putInt(CFG_KEY_LIM,     cfg.limit);
+  prefs.putString(CFG_SSID, cfg.ssid);
+  prefs.putString(CFG_PW,   cfg.pw);
+  prefs.putString(CFG_HST,  cfg.hst);
+  prefs.putString(CFG_ORT,  cfg.ort);
+  prefs.putInt(CFG_OFF,     cfg.offsetMin);
+  prefs.putInt(CFG_LIM,     cfg.limit);
   prefs.end();
 }
 
-// ---------- Setup-Portal HTML ----------
+// ---------- Setup-Portal HTML (minimal) ----------
 String chipSuffix() {
   uint64_t mac = ESP.getEfuseMac();
   uint16_t tail = (uint16_t)(mac & 0xFFFF);
@@ -275,41 +296,22 @@ String chipSuffix() {
   return String(buf);
 }
 
-const char* HTML_FORM = R"HTML(
-<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>DVB Abfahrtsmonitor Setup</title>
-<style>body{font-family:sans-serif;margin:24px}label{display:block;margin:8px 0 4px}input{width:100%%;padding:8px}button{margin-top:12px;padding:10px 16px}</style>
-</head><body>
-<h2>DVB Abfahrtsmonitor – Setup</h2>
-<ol>
-<li>Mit dem WLAN-Hotspot verbinden (siehe Display).</li>
-<li>Mobile Daten am Smartphone ausschalten (sonst landet der Browser im Internet statt im lokalen Geraet).</li>
-<li>Im Browser <b>http://192.168.4.1</b> oeffnen.</li>
-<li>SSID, Passwort, Haltestelle, Ort, Offset, Anzahl eintragen → Speichern.</li>
-</ol>
-<form method="POST" action="/save">
-<label>WLAN SSID</label><input name="ssid" value="%SSID%">
-<label>WLAN Passwort</label><input name="pw" type="password" value="%PW%">
-<label>Haltestelle (hst)</label><input name="hst" value="%HST%">
-<label>Ort (ort)</label><input name="ort" value="%ORT%">
-<label>Minuten-Offset (vz)</label><input name="offset" type="number" step="1" value="%OFF%">
-<label>Anzahl Eintraege (lim ≤ 5)</label><input name="limit" type="number" step="1" value="%LIM%">
-<button type="submit">Speichern & Neustarten</button>
-</form></body></html>
-)HTML";
-
-String renderForm() {
-  String html = HTML_FORM;
-  html.replace("%SSID%", cfg.ssid);
-  html.replace("%PW%",   cfg.pw);
-  html.replace("%HST%",  cfg.hst);
-  html.replace("%ORT%",  cfg.ort);
-  html.replace("%OFF%",  String(cfg.offsetMin));
-  html.replace("%LIM%",  String(cfg.limit));
+String formHtml() {
+  String html = "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
+                "<title>DVB Setup</title><style>body{font-family:sans-serif;margin:24px}input{width:100%;padding:8px;margin:6px 0}</style></head><body>"
+                "<h2>DVB Abfahrtsmonitor – Setup</h2>"
+                "<form method='POST' action='/save'>"
+                "SSID:<input name='ssid' value='" + cfg.ssid + "'>"
+                "Passwort:<input type='password' name='pw' value='" + cfg.pw + "'>"
+                "Haltestelle (hst):<input name='hst' value='" + cfg.hst + "'>"
+                "Ort (ort):<input name='ort' value='" + cfg.ort + "'>"
+                "Minuten-Offset (vz):<input type='number' name='offset' value='" + String(cfg.offsetMin) + "'>"
+                "Anzahl Eintraege (1..10):<input type='number' min='1' max='10' name='limit' value='" + String(cfg.limit) + "'>"
+                "<button type='submit'>Speichern & Neustarten</button></form></body></html>";
   return html;
 }
 
-void handleRoot() { server.send(200, "text/html", renderForm()); }
+void handleRoot() { server.send(200, "text/html", formHtml()); }
 
 void handleSave() {
   if (server.method() != HTTP_POST) { server.send(405, "text/plain", "Method Not Allowed"); return; }
@@ -318,178 +320,169 @@ void handleSave() {
   if (server.hasArg("hst"))    cfg.hst  = server.arg("hst");
   if (server.hasArg("ort"))    cfg.ort  = server.arg("ort");
   if (server.hasArg("offset")) cfg.offsetMin = server.arg("offset").toInt();
-  if (server.hasArg("limit"))  cfg.limit     = server.arg("limit").toInt();
-  if (cfg.limit < 1) cfg.limit = 1;
-  if (cfg.limit > ROWS) cfg.limit = ROWS;
-
+  if (server.hasArg("limit"))  cfg.limit     = constrain(server.arg("limit").toInt(), 1, MAX_ROWS);
   saveConfig();
-  server.send(200, "text/html",
-              "<html><body><h3>Gespeichert. Neustart...</h3>"
-              "<script>setTimeout(()=>{fetch('/reboot')},500);</script></body></html>");
+  server.send(200, "text/html", "<html><body><h3>Gespeichert. Neustart...</h3></body></html>");
+  delay(500);
+  ESP.restart();
 }
 
-void handleReboot() {
-  server.send(200, "text/plain", "Rebooting...");
-  delay(200);
-  esp_restart();
-}
-
-// --------- Setupmodus: LCD-Paging-Anleitung ----------
-void drawSetupPage(uint8_t page, const String& apName, const IPAddress& ip) {
+// ---------- Setupmodus: LCD-Anleitung (Paging) ----------
+void drawSetupPage(uint8_t page, const String& apName) {
   u8g2.clearBuffer();
-  u8g2.setDrawColor(1); u8g2.drawBox(0,0,WIDTH,HEIGHT);
-  u8g2.setDrawColor(0);
   u8g2.setFont(u8g2_font_6x12_tf);
-
   switch (page) {
-    case 0: {
-      u8g2.setCursor(2, 12); u8g2.print("Setup-Modus aktiv");
-      u8g2.setCursor(2, 26); u8g2.print("AP: "); u8g2.print(apName);
-      u8g2.setCursor(2, 40); u8g2.print("PW: "); u8g2.print(SETUP_PWD);
-      u8g2.setCursor(2, 54); u8g2.print("Taste BOOT: weiter");
-    } break;
-
-    case 1: {
-      u8g2.setCursor(2, 12); u8g2.print("1) Mit WLAN verbinden");
-      u8g2.setCursor(2, 26); u8g2.print("   (AP siehe Seite 1)");
-      u8g2.setCursor(2, 40); u8g2.print("2) Mobile Daten AUS!");
-      u8g2.setCursor(2, 54); u8g2.print("   (sonst kein Portal)");
-    } break;
-
-    case 2: {
-      u8g2.setCursor(2, 12); u8g2.print("3) Browser oeffnen:");
-      u8g2.setCursor(2, 26); u8g2.print("   http://192.168.4.1");
-      u8g2.setCursor(2, 40); u8g2.print("4) SSID/PW/HST/ORT/");
-      u8g2.setCursor(2, 54); u8g2.print("   Offset/Lim speichern");
-    } break;
-
-    case 3: {
-      u8g2.setCursor(2, 12); u8g2.print("Nach Speichern:");
-      u8g2.setCursor(2, 26); u8g2.print("- Geraet startet neu");
-      u8g2.setCursor(2, 40); u8g2.print("- verbindet ins WLAN");
-      u8g2.setCursor(2, 54); u8g2.print("- Anzeige beginnt");
-    } break;
-
-    default: page = 0; break;
+    case 0:
+      u8g2.setCursor(2,14); u8g2.print("Setup-Modus aktiv");
+      u8g2.setCursor(2,28); u8g2.print("AP: "); u8g2.print(apName);
+      u8g2.setCursor(2,42); u8g2.print("PW: collaborative");
+      u8g2.setCursor(2,56); u8g2.print("BOOT = weiter");
+      break;
+    case 1:
+      u8g2.setCursor(2,14); u8g2.print("1) Mit WLAN verbinden");
+      u8g2.setCursor(2,28); u8g2.print("2) Mobile Daten AUS");
+      u8g2.setCursor(2,42); u8g2.print("3) http://192.168.4.1");
+      u8g2.setCursor(2,56); u8g2.print("im Browser oeffnen");
+      break;
+    case 2:
+      u8g2.setCursor(2,14); u8g2.print("Formular ausfuellen:");
+      u8g2.setCursor(2,28); u8g2.print("SSID / Passwort");
+      u8g2.setCursor(2,42); u8g2.print("Haltestelle / Ort");
+      u8g2.setCursor(2,56); u8g2.print("Offset / Anzahl (<=10)");
+      break;
+    case 3:
+      u8g2.setCursor(2,14); u8g2.print("Speichern => Neustart");
+      u8g2.setCursor(2,28); u8g2.print("WLAN verbindet");
+      u8g2.setCursor(2,42); u8g2.print("Anzeige startet");
+      break;
   }
-
   u8g2.sendBuffer();
 }
 
 void startConfigPortal() {
   String apName = "DVB-Setup-" + chipSuffix();
   WiFi.mode(WIFI_AP);
-  WiFi.softAP(apName.c_str(), SETUP_PWD);
-  IPAddress ip = WiFi.softAPIP();
+  WiFi.softAP(apName.c_str(), "collaborative");
 
   server.on("/", HTTP_GET, handleRoot);
   server.on("/save", HTTP_POST, handleSave);
-  server.on("/reboot", HTTP_GET, handleReboot);
   server.begin();
 
-  // Paging-Loop (blockierend, bis Reboot)
+  // LCD-Anleitung mit Paging (Auto 4s, manuell mit BOOT)
   uint8_t page = 0;
-  uint32_t tPage = 0;
-
-  drawSetupPage(page, apName, ip);
-  tPage = millis();
+  uint32_t tp = millis();
+  drawSetupPage(page, apName);
 
   while (true) {
     server.handleClient();
-
-    // Button manuell: weiterblättern
-    static bool lastBtn = false;
-    bool btn = (digitalRead(CONFIG_BUTTON_PIN) == LOW);
-    if (btn && !lastBtn) {
-      page = (page + 1) % 4;
-      drawSetupPage(page, apName, ip);
-      tPage = millis();
-    }
-    lastBtn = btn;
-
-    // Auto-Paging
-    if (millis() - tPage >= SETUP_PAGE_MS) {
-      page = (page + 1) % 4;
-      drawSetupPage(page, apName, ip);
-      tPage = millis();
-    }
-
+    bool btn = (digitalRead(BOOT_BUTTON_PIN) == LOW);
+    static bool last = false;
+    if (btn && !last) { page = (page + 1) % 4; drawSetupPage(page, apName); tp = millis(); }
+    last = btn;
+    if (millis() - tp >= 4000UL) { page = (page + 1) % 4; drawSetupPage(page, apName); tp = millis(); }
     delay(2);
   }
 }
 
 // ---------- Setup / Loop ----------
 void setup() {
-  pinMode(CONFIG_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
   Serial.begin(115200);
   delay(50);
 
   Wire.begin(SDA_PIN, SCL_PIN);
   Wire.setClock(400000);
-  u8g2.setI2CAddress(I2C_ADDR_7BIT << 1);
-  u8g2.begin(); u8g2.enableUTF8Print(); u8g2.setContrast(185);
 
-  // Splash mit Setup-Hinweis
+  u8g2.setI2CAddress(I2C_ADDR_7BIT << 1);
+  u8g2.begin();
+  u8g2.enableUTF8Print();
+  u8g2.setContrast(185);
+  u8g2.sendF("c", 0xA7);  // INVERSE mode (alles invertiert)
+
+  // Boot-Hinweis mit Setup-Fenster
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_6x12_tf);
-  u8g2.setCursor(2, 14); u8g2.print("DVB Abfahrtsmonitor");
-  u8g2.setCursor(2, 30); u8g2.print("Halte BOOT fuer Setup");
-  u8g2.setCursor(2, 44); u8g2.print("(warte 5 Sek.)");
+  u8g2.setCursor(2,14); u8g2.print("DVB Abfahrtsmonitor");
+  u8g2.setCursor(2,30); u8g2.print("Halte BOOT fuer Setup");
+  u8g2.setCursor(2,44); u8g2.print("(warte 5 Sek.)");
   u8g2.sendBuffer();
 
-  // Setup-Fenster
-  uint32_t start = millis();
-  while (millis() - start < BOOT_DELAY_MS) {
-    if (digitalRead(CONFIG_BUTTON_PIN) == LOW) {
-      WiFi.mode(WIFI_OFF);
-      WiFi.disconnect(true);
-      delay(100);
-      startConfigPortal();  // kehrt nicht zurück
+  uint32_t t0 = millis();
+  while (millis() - t0 < BOOT_DELAY_MS) {
+    if (digitalRead(BOOT_BUTTON_PIN) == LOW) {
+      // Direkt ins Setup-Portal
+      startConfigPortal(); // kehrt nicht zurück
     }
     delay(10);
   }
 
+  // Konfig laden
+  loadConfig();
+
+  // WLAN verbinden
   u8g2.clearBuffer();
   u8g2.setCursor(2, 14); u8g2.print("Verbinde WLAN...");
   u8g2.sendBuffer();
 
-  loadConfig();
-
   WiFi.mode(WIFI_STA);
   if (cfg.ssid.length()) WiFi.begin(cfg.ssid.c_str(), cfg.pw.c_str());
 
-  uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_CONNECT_MS) delay(100);
+  uint32_t tc = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis()-tc) < WIFI_CONNECT_MS) delay(100);
   if (WiFi.status() != WL_CONNECTED) {
-    startConfigPortal();  // kehrt nicht zurück
+    startConfigPortal(); // kehrt nicht zurück
   }
 
   fetchOnce();
+
+  // Paging init
+  uint8_t maxRows = min(cfg.limit, (int)MAX_ROWS);
+  pageCount = max<uint8_t>(1, (uint8_t)((maxRows + VISIBLE_ROWS - 1) / VISIBLE_ROWS));
+  pageIndex = 0;
+  tPage = millis();
+
   renderFull();
-  tFetch = tScroll = tReset = millis();
+  tFetch = millis();
+  tScroll = millis();
 }
 
 void loop() {
   uint32_t now = millis();
 
+  // 30s Reload
   if (now - tFetch >= FETCH_INTERVAL_MS) {
     if (fetchOnce()) failCount = 0; else if (++failCount > MAX_ERRORS) failCount = 0;
-    renderFull(); tFetch = now;
+
+    // Paging ggf. neu berechnen
+    uint8_t maxRows = min(cfg.limit, (int)MAX_ROWS);
+    pageCount = max<uint8_t>(1, (uint8_t)((maxRows + VISIBLE_ROWS - 1) / VISIBLE_ROWS));
+    if (pageIndex >= pageCount) pageIndex = 0;
+
+    renderFull();
+    tFetch = now;
   }
 
+  // Marquee-Ticks für sichtbare Zeilen
   if (now - tScroll >= SCROLL_INTERVAL_MS) {
     bool any = false;
-    for (auto &r : rows) if (r.needsScroll && r.dest.length()) { r.offsetPx += SCROLL_STEP_PX; any = true; }
+    const uint8_t base = pageIndex * VISIBLE_ROWS;
+    for (uint8_t r=0; r<VISIBLE_ROWS; ++r) {
+      const uint8_t idx = base + r;
+      if (idx >= MAX_ROWS) break;
+      if (!rows[idx].dest.length()) continue;
+      if (rows[idx].textW > COL_DEST_W) {
+        rows[idx].offsetPx += SCROLL_STEP_PX;
+        any = true;
+      }
+    }
     if (any) renderDestOnly();
     tScroll = now;
   }
 
-  if (now - tReset >= RESET_INTERVAL_MS) {
-#if USE_HARD_RESET
-    esp_restart();
-#else
-    softRebuild();
-#endif
-    tReset = now;
+  // Seitenwechsel
+  if (pageCount > 1 && (now - tPage >= PAGE_INTERVAL_MS)) {
+    pageIndex = (pageIndex + 1) % pageCount;
+    renderFull();
+    tPage = now;
   }
 }
