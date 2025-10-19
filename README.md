@@ -41,7 +41,7 @@ Diese Bibliotheken sind alle direkt über den Arduino-Bibliotheksverwalter verf�
 2. **Erster Start (oder keine WLAN-Verbindung):**  
    - Der ESP öffnet ein eigenes WLAN:
      ```
-     SSID: DVB-Setup-XXXX
+     SSID: Wifi@DVB-XXXX
      Passwort: collaborative
      ```
    - Im Display steht eine **Schritt-für-Schritt-Anleitung** (mehrseitig, automatisch weiterblätternd).
