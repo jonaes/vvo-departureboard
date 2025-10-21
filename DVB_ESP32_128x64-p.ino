@@ -58,6 +58,7 @@ const uint8_t COL_DEST_W = 128 - DISP_XOFF - COL_DEST_X - COL_RIGHT_W - 2;
 #define CFG_ORT  "ort"
 #define CFG_OFF  "offset"
 #define CFG_LIM  "limit"
+#define CFG_SCR  "scroll"
 
 #define DEFAULT_HST  "Reichenbachstrasse"
 #define DEFAULT_ORT  "Dresden"
@@ -72,6 +73,7 @@ struct Config {
   String ssid, pw, hst, ort;
   int offsetMin = DEFAULT_OFF;
   int limit     = DEFAULT_LIM; // 1..10
+  bool scrollDest = true;
 } cfg;
 
 // ---------- Datenmodell ----------
@@ -90,7 +92,7 @@ uint8_t  pageCount = 1;
 uint32_t tPage     = 0;
 
 // ---------- Utils ----------
-static inline void sanitizeDest(String& s) { s.replace("Platz","Pl"); }
+static inline void sanitizeDest(String& s) {/**/ }
 
 static inline void drawRightAlignedText(int16_t rightX, int16_t baseY, const String& s) {
   int w = u8g2.getUTF8Width(s.c_str());
@@ -132,14 +134,21 @@ static String applyOffsetToMins(const String& m) {
   return String(val) + rest;
 }
 
+// ---------- Seitenindikator (Rahmen bei Page > 0) ----------
 static inline void drawPageIndicator() {
-  if (pageCount > 1 && pageIndex > 0) {
-    u8g2.drawPixel(0, 0);
-    u8g2.drawPixel(WIDTH-1, 0);
-    u8g2.drawPixel(0, HEIGHT-1);
-    u8g2.drawPixel(WIDTH-1, HEIGHT-1);
+  if (pageCount <= 1 || pageIndex == 0) return;
+
+  // Gepunkteter 1px-Rand um den Displaybereich
+  for (uint8_t x = 0; x < WIDTH; x += 2) {
+    u8g2.drawPixel(x, 0);           // oben
+    u8g2.drawPixel(x, HEIGHT - 1);  // unten
+  }
+  for (uint8_t y = 0; y < HEIGHT; y += 2) {
+    u8g2.drawPixel(0, y);           // links
+    u8g2.drawPixel(WIDTH - 1, y);   // rechts
   }
 }
+
 
 // ---------- Render ----------
 void renderFull() {
@@ -161,7 +170,8 @@ void renderFull() {
     const int16_t cycle = max<int16_t>(1, textW + gapPx);
 
     u8g2.setClipWindow(COL_DEST_X, baseY-11, COL_DEST_X + COL_DEST_W - 1, baseY);
-    if (textW <= COL_DEST_W || d.length()==0) {
+    const bool shouldScroll = cfg.scrollDest && textW > COL_DEST_W && d.length() != 0;
+    if (!shouldScroll) {
       u8g2.setCursor(COL_DEST_X, baseY-1);
       u8g2.print(d);
     } else {
@@ -203,7 +213,8 @@ void renderDestOnly() {
     const int16_t cycle = max<int16_t>(1, textW + gapPx);
 
     u8g2.setClipWindow(COL_DEST_X, baseY-11, COL_DEST_X + COL_DEST_W - 1, baseY);
-    if (textW <= COL_DEST_W) {
+    const bool shouldScroll = cfg.scrollDest && textW > COL_DEST_W;
+    if (!shouldScroll) {
       u8g2.setCursor(COL_DEST_X, baseY-1); u8g2.print(d);
     } else {
       int16_t x1 = COL_DEST_X - (rows[idx].offsetPx % cycle);
@@ -273,6 +284,7 @@ void loadConfig() {
   cfg.ort  = prefs.getString(CFG_ORT,  DEFAULT_ORT);
   cfg.offsetMin = prefs.getInt(CFG_OFF, DEFAULT_OFF);
   cfg.limit     = prefs.getInt(CFG_LIM, DEFAULT_LIM);
+    cfg.scrollDest = prefs.getBool(CFG_SCR, true);
   prefs.end();
   cfg.limit = constrain(cfg.limit, 1, MAX_ROWS);
 }
@@ -285,6 +297,7 @@ void saveConfig() {
   prefs.putString(CFG_ORT,  cfg.ort);
   prefs.putInt(CFG_OFF,     cfg.offsetMin);
   prefs.putInt(CFG_LIM,     cfg.limit);
+    prefs.putBool(CFG_SCR,    cfg.scrollDest);
   prefs.end();
 }
 
@@ -298,16 +311,18 @@ String chipSuffix() {
 
 String formHtml() {
   String html = "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
-                "<title>DVB Setup</title><style>body{font-family:sans-serif;margin:24px}input{width:100%;padding:8px;margin:6px 0}</style></head><body>"
-                "<h2>DVB Abfahrtsmonitor – Setup</h2>"
-                "<form method='POST' action='/save'>"
-                "SSID:<input name='ssid' value='" + cfg.ssid + "'>"
-                "Passwort:<input type='password' name='pw' value='" + cfg.pw + "'>"
-                "Haltestelle (hst):<input name='hst' value='" + cfg.hst + "'>"
-                "Ort (ort):<input name='ort' value='" + cfg.ort + "'>"
-                "Minuten-Offset (vz):<input type='number' name='offset' value='" + String(cfg.offsetMin) + "'>"
-                "Anzahl Eintraege (1..10):<input type='number' min='1' max='10' name='limit' value='" + String(cfg.limit) + "'>"
-                "<button type='submit'>Speichern & Neustarten</button></form></body></html>";
+                "<title>DVB Setup</title><style>body{font-family:sans-serif;margin:24px}input{width:100%;padding:8px;margin:6px 0}";
+  html += "label{display:block;margin:12px 0 6px}input[type=checkbox]{width:auto;padding:0;margin-right:8px}</style></head><body><h2>DVB Abfahrtsmonitor – Setup</h2><form method='POST' action='/save'>";
+  html += "SSID:<input name='ssid' value='" + cfg.ssid + "'>";
+  html += "Passwort:<input type='password' name='pw' value='" + cfg.pw + "'>";
+  html += "Haltestelle (hst):<input name='hst' value='" + cfg.hst + "'>";
+  html += "Ort (ort):<input name='ort' value='" + cfg.ort + "'>";
+  html += "Minuten-Offset (vz):<input type='number' name='offset' value='" + String(cfg.offsetMin) + "'>";
+  html += "Anzahl Eintraege (1..10):<input type='number' min='1' max='10' name='limit' value='" + String(cfg.limit) + "'>";
+  html += "<label><input type='checkbox' name='scroll' value='1'";
+  if (cfg.scrollDest) html += " checked";
+  html += ">Scrollen aktivieren</label>";
+  html += "<button type='submit'>Speichern & Neustarten</button></form></body></html>";
   return html;
 }
 
@@ -321,6 +336,7 @@ void handleSave() {
   if (server.hasArg("ort"))    cfg.ort  = server.arg("ort");
   if (server.hasArg("offset")) cfg.offsetMin = server.arg("offset").toInt();
   if (server.hasArg("limit"))  cfg.limit     = constrain(server.arg("limit").toInt(), 1, MAX_ROWS);
+    cfg.scrollDest = server.hasArg("scroll");
   saveConfig();
   server.send(200, "text/html", "<html><body><h3>Gespeichert. Neustart...</h3></body></html>");
   delay(500);
@@ -339,28 +355,29 @@ void drawSetupPage(uint8_t page, const String& apName) {
       u8g2.setCursor(2,56); u8g2.print("BOOT = weiter");
       break;
     case 1:
-      u8g2.setCursor(2,14); u8g2.print("1) Mit WLAN verbinden");
-      u8g2.setCursor(2,28); u8g2.print("2) Mobile Daten AUS");
-      u8g2.setCursor(2,42); u8g2.print("3) http://192.168.4.1");
+      u8g2.setCursor(2,14); u8g2.print("- Mit WLAN verbinden");
+      u8g2.setCursor(2,28); u8g2.print("- Mobile Daten AUS");
+      u8g2.setCursor(2,42); u8g2.print("- http://192.168.4.1");
       u8g2.setCursor(2,56); u8g2.print("im Browser oeffnen");
       break;
-    case 2:
-      u8g2.setCursor(2,14); u8g2.print("Formular ausfuellen:");
-      u8g2.setCursor(2,28); u8g2.print("SSID / Passwort");
-      u8g2.setCursor(2,42); u8g2.print("Haltestelle / Ort");
-      u8g2.setCursor(2,56); u8g2.print("Offset / Anzahl (<=10)");
+	      case 2:
+      u8g2.setCursor(2,14); u8g2.print("Setup-Modus aktiv");
+      u8g2.setCursor(2,28); u8g2.print("AP: "); u8g2.print(apName);
+      u8g2.setCursor(2,42); u8g2.print("PW: collaborative");
+      u8g2.setCursor(2,56); u8g2.print("BOOT = weiter");
       break;
-    case 3:
-      u8g2.setCursor(2,14); u8g2.print("Speichern => Neustart");
-      u8g2.setCursor(2,28); u8g2.print("WLAN verbindet");
-      u8g2.setCursor(2,42); u8g2.print("Anzeige startet");
+	      case 3:
+      u8g2.setCursor(2,14); u8g2.print("Setup-Modus aktiv");
+      u8g2.setCursor(2,28); u8g2.print("AP: "); u8g2.print(apName);
+      u8g2.setCursor(2,42); u8g2.print("PW: collaborative");
+      u8g2.setCursor(2,56); u8g2.print("BOOT = weiter");
       break;
   }
   u8g2.sendBuffer();
 }
 
 void startConfigPortal() {
-  String apName = "DVB-Setup-" + chipSuffix();
+  String apName = "Wifi@DVB-" + chipSuffix();
   WiFi.mode(WIFI_AP);
   WiFi.softAP(apName.c_str(), "collaborative");
 
@@ -392,19 +409,19 @@ void setup() {
 
   Wire.begin(SDA_PIN, SCL_PIN);
   Wire.setClock(400000);
-
+  //Wire.setClock(900000);
+  
   u8g2.setI2CAddress(I2C_ADDR_7BIT << 1);
   u8g2.begin();
   u8g2.enableUTF8Print();
   u8g2.setContrast(185);
   u8g2.sendF("c", 0xA7);  // INVERSE mode (alles invertiert)
 
-  // Boot-Hinweis mit Setup-Fenster
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_6x12_tf);
   u8g2.setCursor(2,14); u8g2.print("DVB Abfahrtsmonitor");
-  u8g2.setCursor(2,30); u8g2.print("Halte BOOT fuer Setup");
-  u8g2.setCursor(2,44); u8g2.print("(warte 5 Sek.)");
+  u8g2.setCursor(2,30); u8g2.print("Drücke BOOT für Setup");
+  u8g2.setCursor(2,50); u8g2.print("(Startup nach 5 Sek.)");
   u8g2.sendBuffer();
 
   uint32_t t0 = millis();
@@ -470,7 +487,7 @@ void loop() {
       const uint8_t idx = base + r;
       if (idx >= MAX_ROWS) break;
       if (!rows[idx].dest.length()) continue;
-      if (rows[idx].textW > COL_DEST_W) {
+      if (cfg.scrollDest && rows[idx].textW > COL_DEST_W) {
         rows[idx].offsetPx += SCROLL_STEP_PX;
         any = true;
       }
