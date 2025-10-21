@@ -30,7 +30,9 @@ const uint8_t WIDTH = 128, HEIGHT = 64;
 const int8_t  DISP_XOFF = 0;
 const uint8_t VISIBLE_ROWS = 5;        // sichtbare Zeilen pro Seite
 const uint8_t ROW_H = 12, TOP_Y = 0;
-const uint8_t COL_LINE_W = 22, COL_RIGHT_W = 24, COL_GAP = 4;
+// COL_RIGHT_W tuned so that a two-digit minute string ("88") keeps a 3px gap
+// to the destination column when rendered with u8g2_font_6x12_tf.
+const uint8_t COL_LINE_W = 22, COL_RIGHT_W = 15, COL_GAP = 4;
 const uint8_t COL_DEST_X = DISP_XOFF + COL_LINE_W + COL_GAP;
 const uint8_t COL_DEST_W = 128 - DISP_XOFF - COL_DEST_X - COL_RIGHT_W - 2;
 
